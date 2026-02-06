@@ -1,0 +1,19 @@
+[Unit]
+Description=GridPilot Solar Battery Manager
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=gridpilot
+WorkingDirectory=/opt/gridpilot
+ExecStart=/opt/gridpilot/.venv/bin/python -m src.core.engine
+Restart=always
+RestartSec=30
+EnvironmentFile=/opt/gridpilot/.env
+WatchdogSec=600
+
+[Install]
+WantedBy=multi-user.target
