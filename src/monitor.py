@@ -40,31 +40,39 @@ async def fetch_amber(http: httpx.AsyncClient, token: str, site_id: str):
     return current, forecast
 
 
-async def http_retry(http: httpx.AsyncClient, url: str, retries: int = 3, backoff: float = 5, **kwargs) -> list:
-    """Retry with exponential backoff. Returns parsed JSON or empty list."""
-    for attempt in range(retries):
+async def http_retry(http: httpx.AsyncClient, url: str, deadline_seconds: float = 270, backoff: float = 5, **kwargs) -> list:
+    """Keep retrying until deadline (default 4.5min of the 5min cycle). Exponential backoff capped at 30s."""
+    import time
+    start = time.monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
+        elapsed = time.monotonic() - start
+        if elapsed > deadline_seconds:
+            logger.error("Deadline exceeded for %s after %d attempts (%.0fs)", url.split("/")[-1], attempt - 1, elapsed)
+            return []
         try:
             resp = await http.get(url, **kwargs)
-            if resp.status_code == 429:  # rate limited
-                wait = backoff * (attempt + 1)
-                logger.warning("Rate limited on %s — retry in %.0fs", url.split("/")[-1], wait)
+            if resp.status_code == 429:
+                wait = min(backoff * attempt, 30)
+                logger.warning("Rate limited on %s — retry in %.0fs (attempt %d)", url.split("/")[-1], wait, attempt)
                 await asyncio.sleep(wait)
                 continue
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            if attempt < retries - 1:
-                wait = backoff * (attempt + 1)
-                logger.warning("Attempt %d/%d failed for %s: %s — retry in %.0fs",
-                               attempt + 1, retries, url.split("/")[-1], e, wait)
-                await asyncio.sleep(wait)
-            else:
-                logger.error("All %d attempts failed for %s: %s", retries, url.split("/")[-1], e)
-    return []
+            remaining = deadline_seconds - (time.monotonic() - start)
+            if remaining <= 0:
+                logger.error("Deadline exceeded for %s: %s", url.split("/")[-1], e)
+                return []
+            wait = min(backoff * attempt, 30, remaining)
+            logger.warning("Attempt %d for %s failed: %s — retry in %.0fs (%.0fs remaining)",
+                           attempt, url.split("/")[-1], e, wait, remaining)
+            await asyncio.sleep(wait)
 
 
 async def fetch_weather(http: httpx.AsyncClient, lat: float, lon: float):
-    data = await http_retry(http, f"{WEATHER_BASE}/forecast", params={
+    data = await http_retry(http, f"{WEATHER_BASE}/forecast", deadline_seconds=30, params={
         "latitude": lat, "longitude": lon,
         "hourly": "direct_radiation,cloud_cover,temperature_2m",
         "forecast_hours": 24, "timezone": "auto",
@@ -73,7 +81,7 @@ async def fetch_weather(http: httpx.AsyncClient, lat: float, lon: float):
 
 
 async def fetch_aemo(http: httpx.AsyncClient, region: str):
-    data = await http_retry(http, AEMO_URL, retries=2, backoff=3)
+    data = await http_retry(http, AEMO_URL, deadline_seconds=30)
     if isinstance(data, list):
         for entry in data:
             if entry.get("REGIONID") == region:
