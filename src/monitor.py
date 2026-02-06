@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import httpx
 
 from src.core.config import Config
+from src.strategy.planner import build_day_plan, format_plan, should_override, DayPlan
 
 LOG_FILE = "data/gridpilot.log"
 
@@ -231,6 +232,7 @@ def print_dashboard(
     confidence: float,
     solar_kw: float,
     cycle: int,
+    day_plan: DayPlan | None = None,
 ):
     now = datetime.now()
     import_p = next((p for p in current if p.get("channelType") == "general"), {})
@@ -290,6 +292,9 @@ def print_dashboard(
         print(f"\n  📈 LEARNED PROFILE")
         print(f"     Expected load:   {analysis['learned_load_kw']:.2f} kW  │  Expected export: {analysis.get('learned_export_kw', 0):.2f} kW")
         print(f"     Base load:       {analysis.get('base_load_kw', 0):.2f} kW  │  Solar peak: {analysis.get('solar_peak_kw', 0):.1f} kW")
+
+    if day_plan and day_plan.schedule:
+        print(f"\n{format_plan(day_plan)}")
 
     print(f"\n  {'─'*66}")
     print(f"  🤖 GRIDPILOT SAYS:  {action}")
@@ -355,6 +360,25 @@ async def run():
     logger.info("GridPilot monitor starting — %ds cycle", config.decision_interval_seconds)
 
     cycle = 0
+    day_plan: DayPlan | None = None
+    last_plan_hour = -1
+
+    # Build profile dict for planner
+    profile_dict = None
+    if profile:
+        profile_dict = {
+            "hours": [vars(h) for h in profile.hours],
+        }
+
+    planner_config = {
+        "battery_capacity_kwh": config.battery_capacity_kwh,
+        "round_trip_efficiency": config.battery_round_trip_efficiency,
+        "cycle_cost_cents": config.battery_cycle_cost_cents,
+        "max_charge_kw": config.battery_max_charge_kw,
+        "max_discharge_kw": config.battery_max_discharge_kw,
+        "min_soc_pct": config.battery_min_soc_pct,
+    }
+
     async with httpx.AsyncClient(timeout=15) as http:
         while not shutdown.is_set():
             cycle += 1
@@ -365,9 +389,10 @@ async def run():
 
                 analysis = analyse_forecast(all_prices)
                 hour = datetime.now().hour
+                minute = datetime.now().minute
                 solar_kw = estimate_solar(weather, hour)
 
-                # Use learned profile for load prediction if available
+                # Use learned profile for load prediction
                 if profile:
                     is_weekday = datetime.now().weekday() < 5
                     predicted_load = profile.predicted_import_kw(hour, is_weekday)
@@ -379,12 +404,43 @@ async def run():
 
                 import_cents = next((p["perKwh"] for p in current if p.get("channelType") == "general"), 30)
                 export_cents = abs(next((p["perKwh"] for p in current if p.get("channelType") == "feedIn"), 5))
+                spike = next((p.get("spikeStatus", "none") for p in current if p.get("channelType") == "general"), "none")
 
-                action, reason, confidence = gridpilot_recommendation(
-                    import_cents, export_cents, analysis, solar_kw, hour, config,
-                )
+                # ── Rebuild day plan every 30 min or on first run ──
+                if day_plan is None or hour != last_plan_hour or (minute < 6 and last_plan_hour == hour):
+                    general_prices = [p for p in all_prices if p.get("channelType") == "general"]
+                    feedin_prices = [p for p in all_prices if p.get("channelType") == "feedIn"]
+                    day_plan = build_day_plan(general_prices, feedin_prices, weather, profile_dict, planner_config)
+                    last_plan_hour = hour
+                    logger.info("Day plan rebuilt: %d arbitrage pairs, expected value %.0fc",
+                                day_plan.summary["arbitrage_pairs"],
+                                day_plan.summary["total_expected_cents"])
 
-                print_dashboard(current, analysis, weather, aemo, action, reason, confidence, solar_kw, cycle)
+                # ── Check for real-time overrides (spikes, negative prices) ──
+                override, override_action, override_reason = should_override(
+                    day_plan, import_cents, export_cents, spike)
+
+                if override:
+                    action = {"charge_grid": "⚡ CHARGE FROM GRID", "sell_grid": "💰 SELL TO GRID",
+                              "discharge_house": "🛡️ SPIKE SHIELD"}.get(override_action, override_action)
+                    reason = f"⚠️ OVERRIDE: {override_reason}"
+                    confidence = 0.95
+                else:
+                    # Follow the day plan
+                    planned = day_plan.action_for_time(hour, minute)
+                    if planned:
+                        action = {"charge_grid": "⚡ CHARGE FROM GRID", "sell_grid": "💰 SELL TO GRID",
+                                  "self_consume": "🏠 SELF-CONSUME", "charge_solar": "☀️ SOLAR → BATTERY"
+                                  }.get(planned.action, planned.action)
+                        reason = f"📋 PLAN: {planned.reason}"
+                        confidence = 0.8
+                    else:
+                        # No plan for this slot — fall back to per-interval logic
+                        action, reason, confidence = gridpilot_recommendation(
+                            import_cents, export_cents, analysis, solar_kw, hour, config,
+                        )
+
+                print_dashboard(current, analysis, weather, aemo, action, reason, confidence, solar_kw, cycle, day_plan)
 
                 with open("data/decisions.log", "a") as f:
                     f.write(f"{datetime.now().isoformat()}|{action}|{import_cents:.2f}|{export_cents:.2f}|"
@@ -400,6 +456,7 @@ async def run():
                     profile = await learner.learn(days_back=30)
                     review = reviewer.review(days_back=7)
                     logger.info("Daily re-learn complete. Accuracy: %.1f%%", review["accuracy_pct"])
+                    profile_dict = {"hours": [vars(h) for h in profile.hours]} if profile else None
                 except Exception as e:
                     logger.warning("Daily re-learn failed: %s", e)
 
