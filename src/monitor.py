@@ -34,35 +34,50 @@ INTERVAL_H = 1 / 12
 
 async def fetch_amber(http: httpx.AsyncClient, token: str, site_id: str):
     headers = {"Authorization": f"Bearer {token}"}
-    current = await http.get(f"{AMBER_BASE}/sites/{site_id}/prices/current", headers=headers)
-    current.raise_for_status()
+    current = await http_retry(http, f"{AMBER_BASE}/sites/{site_id}/prices/current", headers=headers)
     await asyncio.sleep(1)  # rate limit
-    forecast = await http.get(f"{AMBER_BASE}/sites/{site_id}/prices", headers=headers, params={"next": 48})
-    forecast.raise_for_status()
-    return current.json(), forecast.json()
+    forecast = await http_retry(http, f"{AMBER_BASE}/sites/{site_id}/prices", headers=headers, params={"next": 48})
+    return current, forecast
+
+
+async def http_retry(http: httpx.AsyncClient, url: str, retries: int = 3, backoff: float = 5, **kwargs) -> list:
+    """Retry with exponential backoff. Returns parsed JSON or empty list."""
+    for attempt in range(retries):
+        try:
+            resp = await http.get(url, **kwargs)
+            if resp.status_code == 429:  # rate limited
+                wait = backoff * (attempt + 1)
+                logger.warning("Rate limited on %s — retry in %.0fs", url.split("/")[-1], wait)
+                await asyncio.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            if attempt < retries - 1:
+                wait = backoff * (attempt + 1)
+                logger.warning("Attempt %d/%d failed for %s: %s — retry in %.0fs",
+                               attempt + 1, retries, url.split("/")[-1], e, wait)
+                await asyncio.sleep(wait)
+            else:
+                logger.error("All %d attempts failed for %s: %s", retries, url.split("/")[-1], e)
+    return []
 
 
 async def fetch_weather(http: httpx.AsyncClient, lat: float, lon: float):
-    resp = await http.get(f"{WEATHER_BASE}/forecast", params={
+    data = await http_retry(http, f"{WEATHER_BASE}/forecast", params={
         "latitude": lat, "longitude": lon,
         "hourly": "direct_radiation,cloud_cover,temperature_2m",
         "forecast_hours": 24, "timezone": "auto",
     })
-    resp.raise_for_status()
-    return resp.json()["hourly"]
+    return data.get("hourly", {}) if isinstance(data, dict) else {}
 
 
 async def fetch_aemo(http: httpx.AsyncClient, region: str):
-    try:
-        resp = await http.get(AEMO_URL)
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, list):
-            for entry in data:
-                if entry.get("REGIONID") == region:
-                    return entry
-    except Exception:
-        pass
+    data = await http_retry(http, AEMO_URL, retries=2, backoff=3)
+    if isinstance(data, list):
+        for entry in data:
+            if entry.get("REGIONID") == region:
+                return entry
     return {}
 
 
