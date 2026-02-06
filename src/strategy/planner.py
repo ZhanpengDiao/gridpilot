@@ -79,12 +79,15 @@ def build_day_plan(
         w["net_kw"] = w["load_kw"] - w["solar_kw"]  # positive = need grid, negative = excess solar
 
     # ── Step 3: Find optimal charge windows ───────────────────
-    # Sort by effective cost to charge (import price / efficiency + degradation)
+    # Prefer offPeak windows for charging — add tariff penalty for peak/shoulder
+    TARIFF_CHARGE_PENALTY = {"offPeak": 0, "shoulder": 3, "peak": 10}  # extra c/kWh
     charge_candidates = [
         w for w in windows
         if w["import_cents"] > 0  # negative handled separately as override
     ]
-    charge_candidates.sort(key=lambda w: w["import_cents"] / efficiency + cycle_cost)
+    charge_candidates.sort(
+        key=lambda w: w["import_cents"] / efficiency + cycle_cost + TARIFF_CHARGE_PENALTY.get(w.get("tariff", "offPeak"), 0)
+    )
 
     # ── Step 4: Find optimal sell windows ─────────────────────
     sell_candidates = [w for w in windows if w["export_cents"] > 0]
@@ -151,16 +154,32 @@ def build_day_plan(
             remaining_capacity -= window_kwh
             break  # move to next sell window
 
-    # ── Step 6: Self-consume during expensive non-sell windows ─
-    for w in windows:
-        if w["key"] in sold_windows or w["key"] in charged_windows:
-            continue
-        if w["net_kw"] > 0 and w["import_cents"] > _median([x["import_cents"] for x in windows]):
+    # ── Step 6: Self-consume during expensive / peak tariff windows ─
+    # Peak tariff windows get priority for self-consumption even at median price
+    TARIFF_SELF_CONSUME_BONUS = {"peak": 15, "shoulder": 5, "offPeak": 0}  # virtual c/kWh bonus
+    median_price = _median([x["import_cents"] for x in windows])
+
+    self_consume_candidates = [
+        w for w in windows
+        if w["key"] not in sold_windows and w["key"] not in charged_windows and w["net_kw"] > 0
+    ]
+    # Sort by value of self-consuming: import price + tariff bonus
+    self_consume_candidates.sort(
+        key=lambda w: w["import_cents"] + TARIFF_SELF_CONSUME_BONUS.get(w.get("tariff", "offPeak"), 0),
+        reverse=True,
+    )
+
+    for w in self_consume_candidates:
+        effective_value = w["import_cents"] + TARIFF_SELF_CONSUME_BONUS.get(w.get("tariff", "offPeak"), 0)
+        # Self-consume if: peak/shoulder tariff, OR above-median price, OR spike risk
+        if w.get("tariff") in ("peak", "shoulder") or w["import_cents"] > median_price or w.get("spike_risk"):
+            tariff_label = f" [{w.get('tariff', '?')}]" if w.get("tariff") != "offPeak" else ""
+            spike_label = " ⚠️spike risk" if w.get("spike_risk") else ""
             schedule.append(ScheduledAction(
                 start_time=w["start"],
                 end_time=w["end"],
                 action="self_consume",
-                reason=f"Above-median price ({w['import_cents']:.1f}c) — use battery for {w['load_kw']:.1f}kW load",
+                reason=f"{w['import_cents']:.1f}c{tariff_label}{spike_label} — use battery for {w['load_kw']:.1f}kW load",
                 import_price=w["import_cents"],
                 export_price=0,
                 expected_value=w["import_cents"] * min(w["load_kw"], max_discharge_kw) * 0.5,
@@ -212,6 +231,8 @@ def format_plan(plan: DayPlan) -> str:
         f"     Arbitrage pairs: {plan.summary['arbitrage_pairs']} | "
         f"Expected value: {plan.summary['total_expected_cents']:.0f}c "
         f"(${plan.summary['total_expected_cents']/100:.2f})",
+        f"     Self-consume: {plan.summary['self_consume_windows']} windows "
+        f"(peak/shoulder prioritised) | Solar charge: {plan.summary['solar_charge_windows']}",
         "",
         f"     {'Time':12s} {'Action':16s} {'Price':>8s}  Reason",
         f"     {'─'*70}",
@@ -239,11 +260,13 @@ def should_override(plan: DayPlan, current_import: float, current_export: float,
 # ── Helpers ───────────────────────────────────────────────────
 
 def _build_windows(general: list[dict], feedin: list[dict]) -> list[dict]:
-    """Group 5-min intervals into 30-min windows with avg prices."""
+    """Group 5-min intervals into 30-min windows with avg prices and tariff info."""
     from collections import defaultdict
 
     gen_by_slot = defaultdict(list)
     fi_by_slot = defaultdict(list)
+    tariff_by_slot = {}
+    spike_by_slot = {}
 
     for p in general:
         if p.get("type") != "ForecastInterval":
@@ -254,6 +277,12 @@ def _build_windows(general: list[dict], feedin: list[dict]) -> list[dict]:
             m = int(t[14:16])
             slot = f"{h:02d}:{(m // 30) * 30:02d}"
             gen_by_slot[slot].append(p["perKwh"])
+            # Capture tariff info from first interval in slot
+            if slot not in tariff_by_slot:
+                ti = p.get("tariffInformation", {})
+                tariff_by_slot[slot] = ti.get("period", "offPeak")
+            if p.get("spikeStatus", "none") != "none":
+                spike_by_slot[slot] = p["spikeStatus"]
 
     for p in feedin:
         if p.get("type") != "ForecastInterval":
@@ -271,6 +300,7 @@ def _build_windows(general: list[dict], feedin: list[dict]) -> list[dict]:
         end_m = m + 30
         end_h = h + (end_m // 60)
         end_m = end_m % 60
+        tariff = tariff_by_slot.get(slot, "offPeak")
         windows.append({
             "key": slot,
             "time_idx": i,
@@ -279,6 +309,8 @@ def _build_windows(general: list[dict], feedin: list[dict]) -> list[dict]:
             "end": f"{end_h:02d}:{end_m:02d}",
             "import_cents": sum(gen_by_slot[slot]) / len(gen_by_slot[slot]),
             "export_cents": sum(fi_by_slot.get(slot, [0])) / max(len(fi_by_slot.get(slot, [1])), 1),
+            "tariff": tariff,
+            "spike_risk": slot in spike_by_slot,
         })
     return windows
 

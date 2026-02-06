@@ -152,11 +152,14 @@ def gridpilot_recommendation(
     solar_kw: float,
     hour: int,
     config: Config,
+    tariff_period: str = "offPeak",
 ) -> tuple[str, str, float]:
     """GridPilot's own recommendation. Returns (action, reason, confidence)."""
 
     efficiency = config.battery_round_trip_efficiency
     cycle_cost = config.battery_cycle_cost_cents / config.battery_capacity_kwh
+    is_peak = tariff_period == "peak"
+    is_shoulder = tariff_period == "shoulder"
 
     # Effective cost to store and retrieve 1 kWh
     storage_cost = import_cents / efficiency + cycle_cost
@@ -198,20 +201,31 @@ def gridpilot_recommendation(
             return "☀️ SOLAR → GRID", f"Solar ~{expected_solar:.1f}kW. Export decent ({export_cents:.1f}c) — sell direct", 0.7
         return "☀️ SOLAR → BATTERY", f"Solar ~{expected_solar:.1f}kW. Low export ({export_cents:.1f}c) — store for peak", 0.8
 
-    # 5. Peak hours — self consume
+    # 5. Peak/shoulder tariff — self consume (tariff-aware)
     learned_load = analysis.get("learned_load_kw", None)
+    if is_peak and import_cents > avg_price * 0.8:
+        load_str = f", expected load {learned_load:.1f}kW" if learned_load else ""
+        saving = import_cents - cycle_cost
+        return "🏠 SELF-CONSUME", f"[PEAK tariff] import {import_cents:.1f}c{load_str}. Save {saving:.1f}c/kWh", 0.9
+
+    if is_shoulder and import_cents > avg_price:
+        load_str = f", expected load {learned_load:.1f}kW" if learned_load else ""
+        saving = import_cents - cycle_cost
+        return "🏠 SELF-CONSUME", f"[SHOULDER tariff] import {import_cents:.1f}c (above avg {avg_price:.0f}c){load_str}. Save {saving:.1f}c/kWh", 0.75
+
     if 16 <= hour < 21 and import_cents > avg_price:
         load_str = f", expected load {learned_load:.1f}kW" if learned_load else ""
         saving = import_cents - cycle_cost
-        return "🏠 SELF-CONSUME", f"Peak hour, import {import_cents:.1f}c (above avg {avg_price:.0f}c){load_str}. Save {saving:.1f}c/kWh", 0.8
+        return "🏠 SELF-CONSUME", f"Evening peak, import {import_cents:.1f}c (above avg {avg_price:.0f}c){load_str}. Save {saving:.1f}c/kWh", 0.8
 
-    # 6. Shoulder — mild self-consume if load is above base
+    # 6. Above-base load during non-offPeak — mild self-consume
     base_load = analysis.get("base_load_kw", 0.15)
     if learned_load and learned_load > base_load * 2 and import_cents > avg_price * 1.1:
-        return "🏠 SELF-CONSUME", f"Above-base load ({learned_load:.1f}kW vs base {base_load:.2f}kW), price {import_cents:.1f}c > avg", 0.6
+        tariff_str = f" [{tariff_period}]" if tariff_period != "offPeak" else ""
+        return "🏠 SELF-CONSUME", f"Above-base load ({learned_load:.1f}kW vs {base_load:.2f}kW){tariff_str}, {import_cents:.1f}c > avg", 0.6
 
     # 7. Nothing compelling
-    return "😴 IDLE", f"No clear opportunity. Import {import_cents:.1f}c, export {export_cents:.1f}c, avg forecast {avg_price:.0f}c", 0.5
+    return "😴 IDLE", f"No clear opportunity. Import {import_cents:.1f}c, export {export_cents:.1f}c, avg {avg_price:.0f}c [{tariff_period}]", 0.5
 
 
 def format_time(iso_str: str) -> str:
@@ -436,8 +450,11 @@ async def run():
                         confidence = 0.8
                     else:
                         # No plan for this slot — fall back to per-interval logic
+                        tariff_period = next(
+                            (p.get("tariffInformation", {}).get("period", "offPeak")
+                             for p in current if p.get("channelType") == "general"), "offPeak")
                         action, reason, confidence = gridpilot_recommendation(
-                            import_cents, export_cents, analysis, solar_kw, hour, config,
+                            import_cents, export_cents, analysis, solar_kw, hour, config, tariff_period,
                         )
 
                 print_dashboard(current, analysis, weather, aemo, action, reason, confidence, solar_kw, cycle, day_plan)
