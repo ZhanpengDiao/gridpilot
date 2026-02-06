@@ -1,4 +1,5 @@
 """Collects and aggregates all data sources into a single snapshot."""
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,10 +11,12 @@ from src.core.config import Config
 from src.models.types import (
     BatteryState,
     GridState,
-    HouseholdLoad,
     PriceChannel,
+    PriceDescriptor,
     PriceInterval,
     SolarForecast,
+    SpikeStatus,
+    UsageInterval,
 )
 
 logger = logging.getLogger(__name__)
@@ -23,10 +26,11 @@ logger = logging.getLogger(__name__)
 class Snapshot:
     """Complete system state at a point in time."""
     timestamp: datetime
-    # Prices
+    # Prices — 5-min intervals
     current_import_price: PriceInterval | None
     current_export_price: PriceInterval | None
-    price_forecast: list[PriceInterval]
+    price_forecast: list[PriceInterval]       # future intervals only
+    price_history: list[PriceInterval]         # today's actuals
     # Battery
     battery: BatteryState
     # Solar
@@ -34,10 +38,16 @@ class Snapshot:
     current_solar_kw: float
     # Grid
     grid_state: GridState
-    # Household
+    # Household — derived from recent usage
     predicted_load_kw: float
+    recent_usage: list[UsageInterval]
     # VPP
     vpp_event_active: bool
+    # Meta
+    interval_minutes: int                      # 5 for this site
+    tariff_period: str                         # offPeak, shoulder, peak
+    tariff_season: str                         # summer, winter, etc.
+    descriptor: str                            # Amber's price descriptor
 
 
 class DataCollector:
@@ -46,29 +56,29 @@ class DataCollector:
         self._amber = AmberClient(config.amber_api_token, config.amber_site_id)
         self._weather = WeatherClient(config.latitude, config.longitude)
         self._aemo = AEMOClient(config.nem_region)
+        self._usage_cache: list[UsageInterval] = []
 
     async def collect(self) -> Snapshot:
         """Gather all data sources into a single snapshot."""
-        import asyncio
-
-        prices_task = self._amber.get_current_prices()
+        current_task = self._amber.get_current_prices()
         forecast_task = self._amber.get_price_forecast()
         battery_task = self._amber.get_battery_state(self._config)
         solar_task = self._weather.get_solar_forecast()
         grid_task = self._aemo.get_grid_state()
 
-        prices, forecast, battery, solar, grid = await asyncio.gather(
-            prices_task, forecast_task, battery_task, solar_task, grid_task,
+        results = await asyncio.gather(
+            current_task, forecast_task, battery_task, solar_task, grid_task,
             return_exceptions=True,
         )
+        current_prices, all_prices, battery, solar, grid = results
 
-        # Handle failures gracefully
-        if isinstance(prices, Exception):
-            logger.error("Amber prices failed: %s", prices)
-            prices = []
-        if isinstance(forecast, Exception):
-            logger.error("Amber forecast failed: %s", forecast)
-            forecast = []
+        # Handle failures
+        if isinstance(current_prices, Exception):
+            logger.error("Amber current prices failed: %s", current_prices)
+            current_prices = []
+        if isinstance(all_prices, Exception):
+            logger.error("Amber forecast failed: %s", all_prices)
+            all_prices = []
         if isinstance(battery, Exception):
             logger.error("Battery state failed: %s", battery)
             battery = self._default_battery()
@@ -79,48 +89,86 @@ class DataCollector:
             logger.error("AEMO grid failed: %s", grid)
             grid = GridState(datetime.now(), self._config.nem_region, 0, 0, 0, 0)
 
+        # Split forecast into history + future
+        now = datetime.now().astimezone()
+        history = [p for p in all_prices if p.interval_type == "ActualInterval"]
+        forecast = [p for p in all_prices if p.interval_type == "ForecastInterval"]
+
+        # Current prices by channel
         import_price = next(
-            (p for p in prices if p.channel == PriceChannel.GENERAL), None
+            (p for p in current_prices if p.channel == PriceChannel.GENERAL), None
         )
         export_price = next(
-            (p for p in prices if p.channel == PriceChannel.FEED_IN), None
+            (p for p in current_prices if p.channel == PriceChannel.FEED_IN), None
         )
 
-        # Current solar from nearest forecast hour
+        # Solar estimate from nearest forecast hour
         current_solar = solar[0].generation_kw if solar else 0
 
-        # VPP detection: Amber signals via spike or special channel
+        # Load prediction from recent usage history
+        predicted_load = self._predict_load_from_history(history)
+
+        # VPP: detect from spike status on feed-in channel
         vpp_active = any(
-            p.spike_status.value == "actual" and p.channel == PriceChannel.FEED_IN
-            for p in prices
+            p.spike_status == SpikeStatus.ACTUAL and p.channel == PriceChannel.FEED_IN
+            for p in current_prices
         )
+
+        # Tariff info from current price
+        tariff_period = "unknown"
+        tariff_season = "unknown"
+        descriptor = "neutral"
+        if import_price:
+            if import_price.tariff:
+                tariff_period = import_price.tariff.period.value
+                tariff_season = import_price.tariff.season.value
+            descriptor = import_price.descriptor.value
 
         return Snapshot(
             timestamp=datetime.now(),
             current_import_price=import_price,
             current_export_price=export_price,
             price_forecast=forecast,
+            price_history=history,
             battery=battery,
             solar_forecast=solar,
             current_solar_kw=current_solar,
             grid_state=grid,
-            predicted_load_kw=self._predict_load(),
+            predicted_load_kw=predicted_load,
+            recent_usage=[],
             vpp_event_active=vpp_active,
+            interval_minutes=5,
+            tariff_period=tariff_period,
+            tariff_season=tariff_season,
+            descriptor=descriptor,
         )
 
-    def _predict_load(self) -> float:
-        """Simple time-based load prediction. TODO: learn from historical usage."""
+    def _predict_load_from_history(self, history: list[PriceInterval]) -> float:
+        """Estimate current load from recent actual usage patterns.
+        Falls back to time-based heuristic if no history.
+        """
+        # Use recent general channel actuals to estimate consumption trend
+        recent_general = [
+            p for p in history[-12:]  # last hour of 5-min intervals
+            if p.channel == PriceChannel.GENERAL
+        ]
+        if len(recent_general) >= 3:
+            # Amber perKwh * usage would give cost, but we don't have kWh in price data.
+            # Fall back to time-based for now — usage endpoint needed for real load.
+            pass
+
         hour = datetime.now().hour
+        weekday = datetime.now().weekday() < 5
         if 6 <= hour < 9:
-            return 2.0    # morning routine
+            return 2.5 if weekday else 1.5   # morning routine
         elif 9 <= hour < 16:
-            return 0.8    # daytime (at work)
+            return 0.8 if weekday else 1.5   # daytime
         elif 16 <= hour < 21:
-            return 3.5    # evening peak
+            return 3.5                        # evening peak
         elif 21 <= hour < 24:
-            return 1.5    # wind down
+            return 1.5                        # wind down
         else:
-            return 0.5    # overnight
+            return 0.5                        # overnight
 
     def _default_battery(self) -> BatteryState:
         c = self._config

@@ -20,7 +20,7 @@ class Config:
     battery_min_soc_pct: float = float(os.getenv("BATTERY_MIN_SOC_PERCENT", "20"))
     battery_cycle_cost_cents: float = float(os.getenv("BATTERY_CYCLE_COST_CENTS", "5"))
 
-    # Location
+    # Location — Endeavour Energy network area
     latitude: float = float(os.getenv("LATITUDE", "-33.8688"))
     longitude: float = float(os.getenv("LONGITUDE", "151.2093"))
     nem_region: str = os.getenv("NEM_REGION", "NSW1")
@@ -30,7 +30,7 @@ class Config:
     sell_price_threshold_cents: float = float(os.getenv("SELL_PRICE_THRESHOLD_CENTS", "25"))
     spike_reserve_soc_pct: float = float(os.getenv("SPIKE_RESERVE_SOC_PERCENT", "40"))
 
-    # Engine
+    # Engine — 5-min intervals to match Amber's data resolution
     decision_interval_seconds: int = int(os.getenv("DECISION_INTERVAL_SECONDS", "300"))
 
     # Logging

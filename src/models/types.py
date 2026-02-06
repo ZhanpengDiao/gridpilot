@@ -23,15 +23,98 @@ class PriceChannel(Enum):
     CONTROLLED_LOAD = "controlledLoad"
 
 
+class PriceDescriptor(Enum):
+    """Amber's price descriptor — indicates how current price compares to typical."""
+    NEGATIVE = "negative"
+    EXTREMELY_LOW = "extremelyLow"
+    VERY_LOW = "veryLow"
+    LOW = "low"
+    NEUTRAL = "neutral"
+    HIGH = "high"
+    SPIKE = "spike"
+
+
+class TariffPeriod(Enum):
+    OFF_PEAK = "offPeak"
+    SHOULDER = "shoulder"
+    PEAK = "peak"
+
+
+class TariffSeason(Enum):
+    SUMMER = "summer"
+    AUTUMN = "autumn"
+    WINTER = "winter"
+    SPRING = "spring"
+
+
+@dataclass
+class TariffInfo:
+    period: TariffPeriod
+    season: TariffSeason
+
+
 @dataclass
 class PriceInterval:
     timestamp: datetime
+    end_time: datetime
     per_kwh_cents: float          # c/kWh including all charges
     spot_per_kwh_cents: float     # wholesale spot only
     channel: PriceChannel
     spike_status: SpikeStatus
+    descriptor: PriceDescriptor
     renewables_pct: float
-    is_forecast: bool
+    tariff: TariffInfo | None
+    duration_minutes: int         # 5 for your site
+    interval_type: str            # ActualInterval, CurrentInterval, ForecastInterval
+    is_estimate: bool
+
+    @property
+    def is_forecast(self) -> bool:
+        return self.interval_type == "ForecastInterval"
+
+    @property
+    def is_current(self) -> bool:
+        return self.interval_type == "CurrentInterval"
+
+
+@dataclass
+class UsageInterval:
+    timestamp: datetime
+    end_time: datetime
+    channel: PriceChannel
+    channel_id: str               # E1, B1
+    kwh: float
+    cost_cents: float
+    per_kwh_cents: float
+    spot_per_kwh_cents: float
+    spike_status: SpikeStatus
+    descriptor: PriceDescriptor
+    renewables_pct: float
+    tariff: TariffInfo | None
+    quality: str                  # billable, estimated
+
+
+@dataclass
+class SiteInfo:
+    site_id: str
+    nmi: str
+    network: str
+    status: str
+    active_from: str
+    interval_minutes: int
+    channels: list[dict]
+
+    @property
+    def has_feed_in(self) -> bool:
+        return any(c["type"] == "feedIn" for c in self.channels)
+
+    @property
+    def has_battery(self) -> bool:
+        return any(c["type"] == "battery" for c in self.channels)
+
+    @property
+    def channel_ids(self) -> dict[str, str]:
+        return {c["type"]: c["identifier"] for c in self.channels}
 
 
 @dataclass
