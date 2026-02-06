@@ -1,6 +1,6 @@
-# Solar Battery Amber VPP
+# GridPilot
 
-Residential solar battery management system integrated with [Amber Electric's](https://www.amber.com.au/) Virtual Power Plant (VPP).
+Autopilot for your residential solar battery — integrated with [Amber Electric's](https://www.amber.com.au/) Virtual Power Plant (VPP).
 
 ## Overview
 
