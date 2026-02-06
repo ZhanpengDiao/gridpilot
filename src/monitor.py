@@ -190,18 +190,24 @@ def gridpilot_recommendation(
 
     # 4. Solar generating — store it
     if solar_kw > 0.5:
+        learned_export = analysis.get("learned_export_kw", 0)
+        # If learned profile says we normally export more, trust that
+        expected_solar = max(solar_kw, learned_export)
         if export_cents > avg_price * 0.8:
-            return "☀️ SOLAR → GRID", f"Solar generating {solar_kw:.1f}kW. Export price decent ({export_cents:.1f}c) — sell direct", 0.7
-        return "☀️ SOLAR → BATTERY", f"Solar generating {solar_kw:.1f}kW. Low export ({export_cents:.1f}c) — store for peak", 0.8
+            return "☀️ SOLAR → GRID", f"Solar ~{expected_solar:.1f}kW. Export decent ({export_cents:.1f}c) — sell direct", 0.7
+        return "☀️ SOLAR → BATTERY", f"Solar ~{expected_solar:.1f}kW. Low export ({export_cents:.1f}c) — store for peak", 0.8
 
     # 5. Peak hours — self consume
+    learned_load = analysis.get("learned_load_kw", None)
     if 16 <= hour < 21 and import_cents > avg_price:
+        load_str = f", expected load {learned_load:.1f}kW" if learned_load else ""
         saving = import_cents - cycle_cost
-        return "🏠 SELF-CONSUME", f"Peak hour, import {import_cents:.1f}c (above avg {avg_price:.0f}c). Use battery, save {saving:.1f}c/kWh", 0.8
+        return "🏠 SELF-CONSUME", f"Peak hour, import {import_cents:.1f}c (above avg {avg_price:.0f}c){load_str}. Save {saving:.1f}c/kWh", 0.8
 
-    # 6. Shoulder — mild self-consume
-    if import_cents > avg_price * 1.2:
-        return "🏠 SELF-CONSUME", f"Above-average price ({import_cents:.1f}c vs avg {avg_price:.0f}c). Use battery if charged", 0.6
+    # 6. Shoulder — mild self-consume if load is above base
+    base_load = analysis.get("base_load_kw", 0.15)
+    if learned_load and learned_load > base_load * 2 and import_cents > avg_price * 1.1:
+        return "🏠 SELF-CONSUME", f"Above-base load ({learned_load:.1f}kW vs base {base_load:.2f}kW), price {import_cents:.1f}c > avg", 0.6
 
     # 7. Nothing compelling
     return "😴 IDLE", f"No clear opportunity. Import {import_cents:.1f}c, export {export_cents:.1f}c, avg forecast {avg_price:.0f}c", 0.5
@@ -280,6 +286,11 @@ def print_dashboard(
         print(f"\n  🔌 NEM GRID (NSW1)")
         print(f"     Demand: {aemo_demand:.0f} MW  │  Dispatch price: ${aemo_price:.2f}/MWh")
 
+    if analysis.get("learned_load_kw") is not None:
+        print(f"\n  📈 LEARNED PROFILE")
+        print(f"     Expected load:   {analysis['learned_load_kw']:.2f} kW  │  Expected export: {analysis.get('learned_export_kw', 0):.2f} kW")
+        print(f"     Base load:       {analysis.get('base_load_kw', 0):.2f} kW  │  Solar peak: {analysis.get('solar_peak_kw', 0):.1f} kW")
+
     print(f"\n  {'─'*66}")
     print(f"  🤖 GRIDPILOT SAYS:  {action}")
     print(f"     {reason}")
@@ -287,10 +298,18 @@ def print_dashboard(
     print(f"{'='*70}\n")
 
 
+def _profile_stale(profile) -> bool:
+    """Re-learn if profile is older than 24 hours."""
+    try:
+        updated = datetime.fromisoformat(profile.last_updated)
+        return (datetime.now() - updated).total_seconds() > 86400
+    except Exception:
+        return True
+
+
 async def run():
     config = Config()
     if not config.amber_api_token:
-        # Read from file if env not set
         try:
             with open("/home/zhanpeng/repo/own/amber") as f:
                 lines = f.read().strip().split("\n")
@@ -301,6 +320,32 @@ async def run():
 
     if not config.amber_site_id:
         config.amber_site_id = "01K586V49X2WQ2EBY00YANFP8N"
+
+    # Learn from history on startup
+    from src.data.learner import UsageLearner, DecisionReviewer
+    learner = UsageLearner(config.amber_api_token, config.amber_site_id)
+    profile = learner.load_cached()
+    if profile is None or _profile_stale(profile):
+        logger.info("Learning usage profile from history...")
+        try:
+            profile = await learner.learn(days_back=30)
+        except Exception as e:
+            logger.warning("Learning failed: %s — using defaults", e)
+            profile = None
+
+    if profile:
+        logger.info("Profile: base load %.2fkW, solar peak %.1fkW, "
+                     "peak import %d:00, peak export %d:00, %d days analysed",
+                     profile.base_load_kw, profile.solar_peak_kw,
+                     profile.peak_import_hour, profile.peak_export_hour,
+                     profile.days_analysed)
+
+    # Review past decisions
+    reviewer = DecisionReviewer()
+    review = reviewer.review(days_back=7)
+    if review["total"] > 0:
+        logger.info("Decision review: %d decisions, %.1f%% accuracy, %d bad calls",
+                     review["total"], review["accuracy_pct"], len(review["bad_calls"]))
 
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -314,15 +359,23 @@ async def run():
         while not shutdown.is_set():
             cycle += 1
             try:
-                # Fetch all data
                 current, all_prices = await fetch_amber(http, config.amber_api_token, config.amber_site_id)
                 weather = await fetch_weather(http, config.latitude, config.longitude)
                 aemo = await fetch_aemo(http, config.nem_region)
 
-                # GridPilot's own analysis
                 analysis = analyse_forecast(all_prices)
                 hour = datetime.now().hour
                 solar_kw = estimate_solar(weather, hour)
+
+                # Use learned profile for load prediction if available
+                if profile:
+                    is_weekday = datetime.now().weekday() < 5
+                    predicted_load = profile.predicted_import_kw(hour, is_weekday)
+                    predicted_export = profile.predicted_export_kw(hour, is_weekday)
+                    analysis["learned_load_kw"] = round(predicted_load, 2)
+                    analysis["learned_export_kw"] = round(predicted_export, 2)
+                    analysis["base_load_kw"] = profile.base_load_kw
+                    analysis["solar_peak_kw"] = profile.solar_peak_kw
 
                 import_cents = next((p["perKwh"] for p in current if p.get("channelType") == "general"), 30)
                 export_cents = abs(next((p["perKwh"] for p in current if p.get("channelType") == "feedIn"), 5))
@@ -333,7 +386,6 @@ async def run():
 
                 print_dashboard(current, analysis, weather, aemo, action, reason, confidence, solar_kw, cycle)
 
-                # Also log to file
                 with open("data/decisions.log", "a") as f:
                     f.write(f"{datetime.now().isoformat()}|{action}|{import_cents:.2f}|{export_cents:.2f}|"
                             f"{analysis['forecast_avg']:.1f}|{analysis['forecast_max']:.1f}|"
@@ -341,6 +393,15 @@ async def run():
 
             except Exception as e:
                 logger.error("Cycle %d failed: %s", cycle, e, exc_info=True)
+
+            # Re-learn profile daily at 2am
+            if cycle > 1 and datetime.now().hour == 2 and datetime.now().minute < 6:
+                try:
+                    profile = await learner.learn(days_back=30)
+                    review = reviewer.review(days_back=7)
+                    logger.info("Daily re-learn complete. Accuracy: %.1f%%", review["accuracy_pct"])
+                except Exception as e:
+                    logger.warning("Daily re-learn failed: %s", e)
 
             try:
                 await asyncio.wait_for(shutdown.wait(), timeout=config.decision_interval_seconds)
